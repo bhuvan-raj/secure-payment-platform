@@ -1,0 +1,86 @@
+name: Terraform Apply — Infrastructure
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'terraform/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options: [dev, prod]
+        default: dev
+      action:
+        description: 'Terraform action'
+        required: true
+        type: choice
+        options: [plan, apply, destroy]
+        default: plan
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  TF_VERSION: "~1.7"
+
+jobs:
+  terraform:
+    name: Terraform ${{ inputs.action || 'apply' }} — ${{ inputs.environment || 'dev' }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || 'dev' }}
+    defaults:
+      run:
+        working-directory: terraform/environments/${{ inputs.environment || 'dev' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC — no static keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-terraform-role
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: Terraform-${{ inputs.environment || 'dev' }}-${{ github.run_id }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=secure-payment-tfstate-${{ inputs.environment || 'dev' }}" \
+            -backend-config="key=${{ inputs.environment || 'dev' }}/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=terraform-state-lock" \
+            -backend-config="encrypt=true"
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        if: ${{ inputs.action != 'destroy' }}
+        run: |
+          terraform plan \
+            -var="environment=${{ inputs.environment || 'dev' }}" \
+            -out=tfplan \
+            -no-color 2>&1 | tee plan.txt
+
+      - name: Terraform Apply
+        if: ${{ (inputs.action == 'apply' || github.event_name == 'push') }}
+        run: terraform apply -auto-approve tfplan
+
+      - name: Terraform Destroy
+        if: ${{ inputs.action == 'destroy' }}
+        run: |
+          terraform plan -destroy \
+            -var="environment=${{ inputs.environment || 'dev' }}" \
+            -no-color
+          terraform destroy -auto-approve \
+            -var="environment=${{ inputs.environment || 'dev' }}"

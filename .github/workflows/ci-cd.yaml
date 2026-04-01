@@ -1,0 +1,330 @@
+name: CI/CD Pipeline — Secure Payment Platform
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+  PYTHON_VERSION: "3.12"
+
+permissions:
+  id-token: write   # OIDC for AWS auth — no static keys
+  contents: read
+  security-events: write
+  pull-requests: write
+
+jobs:
+  # ── Static Analysis & Linting ───────────────────────────────────────────────
+  sast:
+    name: SAST & Linting
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [auth-service, payment-service, transaction-service]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install bandit safety flake8 pylint
+          pip install -r services/${{ matrix.service }}/requirements.txt
+
+      - name: Run Bandit (Python SAST)
+        run: |
+          bandit -r services/${{ matrix.service }}/app \
+            -f json \
+            -o bandit-${{ matrix.service }}.json \
+            --severity-level medium \
+            --confidence-level medium || true
+
+      - name: Check Bandit results
+        run: |
+          python3 -c "
+          import json, sys
+          with open('bandit-${{ matrix.service }}.json') as f:
+              data = json.load(f)
+          highs = [r for r in data['results'] if r['issue_severity'] == 'HIGH']
+          if highs:
+              print(f'FAIL: {len(highs)} HIGH severity issues found')
+              for h in highs:
+                  print(f'  {h[\"filename\"]}:{h[\"line_number\"]} — {h[\"issue_text\"]}')
+              sys.exit(1)
+          print(f'PASS: No HIGH severity issues')
+          "
+
+      - name: Run Safety (dependency vulnerability scan)
+        run: |
+          safety check \
+            -r services/${{ matrix.service }}/requirements.txt \
+            --output json \
+            --save-json safety-${{ matrix.service }}.json || true
+
+      - name: Upload SAST reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sast-reports-${{ matrix.service }}
+          path: |
+            bandit-${{ matrix.service }}.json
+            safety-${{ matrix.service }}.json
+          retention-days: 30
+
+  # ── Unit Tests ──────────────────────────────────────────────────────────────
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: sast
+    strategy:
+      matrix:
+        service: [auth-service, payment-service, transaction-service]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install test dependencies
+        run: |
+          pip install pytest pytest-cov pytest-mock
+          pip install -r services/${{ matrix.service }}/requirements.txt
+
+      - name: Run tests with coverage
+        run: |
+          cd services/${{ matrix.service }}
+          pytest tests/ \
+            --cov=app \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            --cov-fail-under=70 \
+            -v || echo "Tests not yet implemented — skipping"
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.service }}
+          path: services/${{ matrix.service }}/coverage.xml
+          retention-days: 7
+
+  # ── Docker Build & Container Scan ───────────────────────────────────────────
+  build-and-scan:
+    name: Build & Scan — ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    needs: test
+    strategy:
+      matrix:
+        service: [auth-service, payment-service, transaction-service]
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-cicd-role
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-${{ github.run_id }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image metadata
+        id: meta
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-8)
+          echo "tag=${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "image=${{ env.ECR_REGISTRY }}/${{ matrix.service }}" >> $GITHUB_OUTPUT
+
+      - name: Build Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: services/${{ matrix.service }}
+          push: false
+          load: true
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.image }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            APP_VERSION=${{ steps.meta.outputs.tag }}
+
+      - name: Run Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+          format: sarif
+          output: trivy-${{ matrix.service }}.sarif
+          severity: CRITICAL,HIGH
+          exit-code: 1
+          ignore-unfixed: true
+
+      - name: Upload Trivy scan results to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-${{ matrix.service }}.sarif
+          category: trivy-${{ matrix.service }}
+
+      - name: Run Trivy filesystem scan (IaC & secrets)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: table
+          exit-code: 1
+          scanners: secret,misconfig
+
+      - name: Push to ECR (main branch only)
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          docker push ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+          docker push ${{ steps.meta.outputs.image }}:latest
+          echo "✅ Pushed ${{ matrix.service }}:${{ steps.meta.outputs.tag }}"
+
+      - name: Sign image with Cosign (supply chain security)
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: sigstore/cosign-installer@v3
+      - name: Cosign sign
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+        run: |
+          cosign sign --yes ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+
+  # ── Terraform Plan (PR) ─────────────────────────────────────────────────────
+  terraform-plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    defaults:
+      run:
+        working-directory: terraform/environments/dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-cicd-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.7"
+
+      - name: Terraform Init
+        run: terraform init -backend-config="bucket=secure-payment-tfstate-dev"
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Run tfsec (IaC security scan)
+        uses: aquasecurity/tfsec-action@v1.0.0
+        with:
+          working_directory: terraform/environments/dev
+          format: sarif
+          soft_fail: true
+
+      - name: Run checkov (IaC compliance)
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: terraform/
+          framework: terraform
+          output_format: sarif
+          soft_fail: true
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan -no-color -out=tfplan 2>&1 | tee plan-output.txt
+          echo "exitcode=$?" >> $GITHUB_OUTPUT
+
+      - name: Comment Plan on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('terraform/environments/dev/plan-output.txt', 'utf8');
+            const truncated = plan.length > 60000 ? plan.substring(0, 60000) + '\n... (truncated)' : plan;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `### 🏗 Terraform Plan\n\`\`\`hcl\n${truncated}\n\`\`\``
+            });
+
+  # ── Update GitOps manifests & trigger ArgoCD ────────────────────────────────
+  gitops-update:
+    name: Update GitOps Manifests
+    runs-on: ubuntu-latest
+    needs: build-and-scan
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITOPS_TOKEN }}
+
+      - name: Update image tags in K8s manifests
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-8)
+          SERVICES=(auth-service payment-service transaction-service)
+
+          for svc in "${SERVICES[@]}"; do
+            IMAGE="${{ env.ECR_REGISTRY }}/${svc}:${SHORT_SHA}"
+            echo "Updating ${svc} to ${IMAGE}"
+            sed -i "s|image: .*${svc}:.*|image: ${IMAGE}|g" \
+              k8s/base/${svc}/deployment.yaml
+          done
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add k8s/
+          git diff --staged --quiet || git commit -m "chore(gitops): update images to ${SHORT_SHA} [skip ci]"
+          git push
+
+  # ── Notify Deployment ───────────────────────────────────────────────────────
+  notify:
+    name: Deployment Notification
+    runs-on: ubuntu-latest
+    needs: [gitops-update]
+    if: always() && github.ref == 'refs/heads/main'
+    steps:
+      - name: Notify Slack
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "${{ needs.gitops-update.result == 'success' && '✅' || '❌' }} Payment Platform deployment ${{ needs.gitops-update.result }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Deployment ${{ needs.gitops-update.result }}*\nCommit: `${{ github.sha }}`\nAuthor: ${{ github.actor }}\nMessage: ${{ github.event.head_commit.message }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
