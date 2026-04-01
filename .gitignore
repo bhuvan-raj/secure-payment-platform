@@ -1,0 +1,17 @@
+# Terraform
+*.tfstate
+*.tfstate.*
+.terraform/
+
+# Env files
+.env
+
+# Python
+__pycache__/
+*.pyc
+
+# Logs
+*.log
+
+# Mac
+.DS_Store
