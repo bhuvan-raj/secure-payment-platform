@@ -1,0 +1,59 @@
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: payment-platform
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  description: "Secure Payment Platform GitOps Project"
+
+  sourceRepos:
+    - https://github.com/YOUR_ORG/secure-payment-platform.git
+
+  destinations:
+    - namespace: payment-platform
+      server: https://kubernetes.default.svc
+    - namespace: monitoring
+      server: https://kubernetes.default.svc
+    - namespace: argocd
+      server: https://kubernetes.default.svc
+
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRole
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRoleBinding
+    - group: networking.k8s.io
+      kind: IngressClass
+
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+
+  roles:
+    - name: developer
+      description: Developer access — sync only, no delete
+      policies:
+        - p, proj:payment-platform:developer, applications, get, payment-platform/*, allow
+        - p, proj:payment-platform:developer, applications, sync, payment-platform/*, allow
+      groups:
+        - payment-platform-developers
+
+    - name: admin
+      description: Full admin access
+      policies:
+        - p, proj:payment-platform:admin, applications, *, payment-platform/*, allow
+      groups:
+        - payment-platform-admins
+
+  syncWindows:
+    - kind: deny
+      schedule: "0 22 * * 1-5"   # Deny deploys Mon-Fri after 10PM
+      duration: 8h
+      applications:
+        - "*"
+      manualSync: true            # Allow manual override
