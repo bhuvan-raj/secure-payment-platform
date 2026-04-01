@@ -1,0 +1,150 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: transaction-service-sa
+  namespace: payment-platform
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT_ID:role/secure-payment-dev-transaction-service-role
+  labels:
+    app: transaction-service
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: transaction-service
+  namespace: payment-platform
+  labels:
+    app: transaction-service
+    version: "1.0.0"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: transaction-service
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: transaction-service
+        version: "1.0.0"
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8002"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: transaction-service-sa
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: transaction-service
+          image: ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/transaction-service:latest
+          imagePullPolicy: Always
+          ports:
+            - name: metrics
+              containerPort: 8002
+          env:
+            - name: AWS_REGION
+              value: "us-east-1"
+            - name: DB_SECRET_ARN
+              valueFrom:
+                configMapKeyRef:
+                  name: transaction-service-config
+                  key: DB_SECRET_ARN
+            - name: PAYMENT_QUEUE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: transaction-service-config
+                  key: PAYMENT_QUEUE_URL
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8002
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            failureThreshold: 3
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      terminationGracePeriodSeconds: 60   # Allow in-flight message to finish
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: transaction-service
+  namespace: payment-platform
+  labels:
+    app: transaction-service
+spec:
+  type: ClusterIP
+  selector:
+    app: transaction-service
+  ports:
+    - name: metrics
+      port: 8002
+      targetPort: 8002
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: transaction-service-config
+  namespace: payment-platform
+data:
+  DB_SECRET_ARN: "arn:aws:secretsmanager:us-east-1:ACCOUNT_ID:secret:dev/payment-platform/db-auth"
+  PAYMENT_QUEUE_URL: "https://sqs.us-east-1.amazonaws.com/ACCOUNT_ID/dev-payment-queue.fifo"
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: transaction-service-hpa
+  namespace: payment-platform
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: transaction-service
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: transaction-service-pdb
+  namespace: payment-platform
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: transaction-service
